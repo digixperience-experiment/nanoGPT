@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -110,7 +110,7 @@ class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
-    n_head: int = 12
+    n_head: int = 12 # int applies to every layer, OR a list/tuple of length n_layer for a per-layer head count
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -123,11 +123,34 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # n_head may be a single int (every layer the same) or a list/tuple
+        # giving each layer's own head count explicitly. Resolve to one
+        # explicit value per layer, and validate each one up front -- head
+        # count must divide n_embd evenly (head_dim = n_embd // n_head) --
+        # so a bad value fails loudly here with the specific layer and the
+        # actual legal options, instead of a shape-mismatch trace from
+        # inside CausalSelfAttention two calls later.
+        if isinstance(config.n_head, (list, tuple)):
+            assert len(config.n_head) == config.n_layer, (
+                f"n_head has {len(config.n_head)} entries but n_layer={config.n_layer} -- "
+                f"need exactly one n_head value per layer"
+            )
+            n_heads_per_layer = list(config.n_head)
+        else:
+            n_heads_per_layer = [config.n_head] * config.n_layer
+
+        legal = [d for d in range(1, config.n_embd + 1) if config.n_embd % d == 0]
+        for i, nh in enumerate(n_heads_per_layer):
+            assert config.n_embd % nh == 0, (
+                f"layer {i}: n_head={nh} does not divide n_embd={config.n_embd} evenly. "
+                f"Legal n_head values for n_embd={config.n_embd}: {legal}"
+            )
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(replace(config, n_head=nh)) for nh in n_heads_per_layer]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -292,8 +315,13 @@ class GPT(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        # H*Q (n_head * head_dim) always equals n_embd by construction, for
+        # any legal per-layer split -- attention FLOPs don't depend on how
+        # n_embd gets divided into heads, same as attention's parameter
+        # count doesn't. So this is written directly in n_embd, which stays
+        # correct whether cfg.n_head is one int or a per-layer list.
+        L, T = cfg.n_layer, cfg.block_size
+        flops_per_token = 6*N + 12*L*cfg.n_embd*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
