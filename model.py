@@ -10,10 +10,41 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass, replace
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Peak tensor-core FLOPS used as the estimate_mfu() denominator, keyed by a
+# substring of torch.cuda.get_device_name(). Only consulted when
+# GPTConfig.flops_promised is left unset. Most entries are card spec sheets
+# (bf16 dense, no sparsity); the 3060 Laptop entry is a measured value from
+# this project's own benchmarking since Nvidia doesn't publish one. Checked
+# most-specific key first so e.g. "RTX 3060 Laptop" doesn't fall through to
+# the plain "RTX 3060" desktop entry.
+GPU_PEAK_FLOPS = {
+    'H100': 989e12,
+    'A100': 312e12,
+    'RTX 4090': 165e12,
+    'RTX 3090': 71e12,
+    'RTX 3060 Laptop': 20e12,  # measured, not spec -- see project notes
+    'RTX 3060': 25e12,
+    'V100': 125e12,   # fp16 tensor peak; V100 has no bf16 tensor cores
+    'T4': 65e12,      # fp16 tensor peak; T4 has no bf16 tensor cores
+}
+
+def default_flops_promised():
+    """Best-effort peak FLOPS for the current device, for estimate_mfu().
+    Falls back to A100 bf16 peak (312 TFLOPS) -- the original hardcoded
+    value -- when there's no CUDA device or the device name doesn't match
+    anything in GPU_PEAK_FLOPS."""
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        for key, flops in GPU_PEAK_FLOPS.items():
+            if key in name:
+                return flops
+    return 312e12
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -114,6 +145,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    flops_promised: Optional[float] = None # peak FLOPS/s for estimate_mfu(); None = auto-detect from GPU name, falling back to A100
 
 class GPT(nn.Module):
 
@@ -310,7 +342,7 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """ estimate model flops utilization (MFU) in units of the configured (or auto-detected) peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -324,9 +356,9 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*cfg.n_embd*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        # express our flops throughput as a ratio of this GPU's peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_promised = cfg.flops_promised if cfg.flops_promised is not None else default_flops_promised()
         mfu = flops_achieved / flops_promised
         return mfu
 
